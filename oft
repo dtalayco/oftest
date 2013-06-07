@@ -346,162 +346,171 @@ def _space_to(n, str):
         return " " * spaces
     return " "
 
+def main_init_suite_get(oftest):
+    """
+    OFTest runner initialization and test suite determination
+    """
+
+    # Setup global configuration
+    (new_config, args) = config_setup()
+    oftest.config.update(new_config)
+
+    logging_setup(config)
+    logging.info("++++++++ " + time.asctime() + " ++++++++")
+
+    # Pick an OpenFlow protocol module based on the configured version
+    name_to_version = dict((v,k) for k, v in loxi.version_names.iteritems())
+    sys.modules["ofp"] = loxi.protocol(name_to_version[config["openflow_version"]])
+
+    # HACK: testutils.py imports controller.py, which needs the ofp module
+    import oftest.testutils
+
+    # Allow tests to import each other
+    sys.path.append(config["test_dir"])
+
+    test_specs = args
+    if config["test_spec"] != "":
+        print >> sys.stderr, "WARNING: The --test-spec option is deprecated"
+        test_specs += config["test_spec"].split(',')
+    if config["test_file"] != None:
+        with open(config["test_file"], 'r') as f:
+            for line in f:
+                line, _, _ = line.partition('#') # remove comments
+                line = line.strip()
+                if line:
+                    test_specs.append(line)
+    if test_specs == []:
+        test_specs = ["standard"]
+
+    test_modules = load_test_modules(config)
+
+    # Check if test list is requested; display and exit if so
+    # @TODO Break this out of this function
+    if config["list"]:
+        mod_count = 0
+        test_count = 0
+        all_groups = set()
+        print """\
+Tests are shown grouped by module. If a test is in any groups beyond "standard"
+and its module's group then they are shown in parentheses."""
+        print
+        print """\
+Tests marked with '*' are non-standard and may require vendor extensions or
+special switch configuration. These are not part of the "standard" test group."""
+        print
+        print """\
+Tests marked with '!' are disabled because they are experimental, special-purpose,
+or are too long to be run normally. These are not part of the "standard" test
+group or their module's test group."""
+        print
+        print "Tests marked (TP1) after name take --test-params including:"
+        print "    'vid=N;strip_vlan=bool;add_vlan=bool'"
+        print
+        print "Test List:"
+        for (modname, (mod, tests)) in test_modules.items():
+            mod_count += 1
+            desc = (mod.__doc__ or "No description").strip().split('\n')[0]
+            start_str = "  Module " + mod.__name__ + ": "
+            print start_str + _space_to(22, start_str) + desc
+            for (testname, test) in tests.items():
+                try:
+                    desc = (test.__doc__ or "").strip()
+                    desc = desc.split('\n')[0]
+                except:
+                    desc = "No description"
+                groups = set(test._groups) - set(["all", "standard", modname])
+                all_groups.update(test._groups)
+                if groups:
+                    desc = "(%s) %s" % (",".join(groups), desc)
+                if hasattr(test, "_versions"):
+                    desc = "(%s) %s" % (",".join(sorted(test._versions)), desc)
+                start_str = " %s%s %s:" % (test._nonstandard and "*" or " ",
+                                           test._disabled and "!" or " ",
+                                           testname)
+                if len(start_str) > 22:
+                    desc = "\n" + _space_to(22, "") + desc
+                print start_str + _space_to(22, start_str) + desc
+                test_count += 1
+            print
+        print "%d modules shown with a total of %d tests" % \
+            (mod_count, test_count)
+        print
+        print "Test groups: %s" % (', '.join(sorted(all_groups)))
+
+        sys.exit(0)
+
+    test_modules = prune_tests(test_specs, test_modules, config["openflow_version"])
+
+    # Check if test list is requested; display and exit if so
+    if config["list_test_names"]:
+        for (modname, (mod, tests)) in test_modules.items():
+            for (testname, test) in tests.items():
+                print "%s.%s" % (modname, testname)
+        sys.exit(0)
+
+    # Generate the test suite
+    #@todo Decide if multiple suites are ever needed
+    suite = unittest.TestSuite()
+
+    for (modname, (mod, tests)) in test_modules.items():
+        for (testname, test) in tests.items():
+            suite.addTest(test())
+
+    # Allow platforms to import each other
+    sys.path.append(config["platform_dir"])
+
+    # Load the platform module
+    platform_name = config["platform"]
+    logging.info("Importing platform: " + platform_name)
+    platform_mod = None
+    try:
+        platform_mod = imp.load_module(platform_name, *imp.find_module(platform_name, [config["platform_dir"]]))
+    except:
+        logging.warn("Failed to import " + platform_name + " platform module")
+        raise
+
+    try:
+        platform_mod.platform_config_update(config)
+    except:
+        logging.warn("Could not run platform host configuration")
+        raise
+
+    if not config["port_map"]:
+        die("Interface port map was not defined by the platform. Exiting.")
+
+    logging.debug("Configuration: " + str(config))
+    logging.info("OF port map: " + str(config["port_map"]))
+
+    oftest.ofutils.default_timeout = config["default_timeout"]
+    oftest.testutils.MINSIZE = config['minsize']
+
+    if os.getuid() != 0 and not config["allow_user"]:
+        print "ERROR: Super-user privileges required. Please re-run with " \
+              "sudo or as root."
+        sys.exit(1)
+
+    if config["random_seed"] is not None:
+        logging.info("Random seed: %d" % config["random_seed"])
+        random.seed(config["random_seed"])
+    else:
+        # Generate random seed and report to log file
+        seed = random.randrange(100000000)
+        logging.info("Autogen random seed: %d" % seed)
+        random.seed(seed)
+
+    # Remove python's signal handler which raises KeyboardError. Exiting from an
+    # exception waits for all threads to terminate which might not happen.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    return suite
+
 #
 # Main script
 #
 
-# Setup global configuration
-(new_config, args) = config_setup()
-oftest.config.update(new_config)
-
-logging_setup(config)
-logging.info("++++++++ " + time.asctime() + " ++++++++")
-
-# Pick an OpenFlow protocol module based on the configured version
-name_to_version = dict((v,k) for k, v in loxi.version_names.iteritems())
-sys.modules["ofp"] = loxi.protocol(name_to_version[config["openflow_version"]])
-
-# HACK: testutils.py imports controller.py, which needs the ofp module
-import oftest.testutils
-
-# Allow tests to import each other
-sys.path.append(config["test_dir"])
-
-test_specs = args
-if config["test_spec"] != "":
-    print >> sys.stderr, "WARNING: The --test-spec option is deprecated"
-    test_specs += config["test_spec"].split(',')
-if config["test_file"] != None:
-    with open(config["test_file"], 'r') as f:
-        for line in f:
-            line, _, _ = line.partition('#') # remove comments
-            line = line.strip()
-            if line:
-                test_specs.append(line)
-if test_specs == []:
-    test_specs = ["standard"]
-
-test_modules = load_test_modules(config)
-
-# Check if test list is requested; display and exit if so
-if config["list"]:
-    mod_count = 0
-    test_count = 0
-    all_groups = set()
-    print """\
-Tests are shown grouped by module. If a test is in any groups beyond "standard"
-and its module's group then they are shown in parentheses."""
-    print
-    print """\
-Tests marked with '*' are non-standard and may require vendor extensions or
-special switch configuration. These are not part of the "standard" test group."""
-    print
-    print """\
-Tests marked with '!' are disabled because they are experimental, special-purpose,
-or are too long to be run normally. These are not part of the "standard" test
-group or their module's test group."""
-    print
-    print "Tests marked (TP1) after name take --test-params including:"
-    print "    'vid=N;strip_vlan=bool;add_vlan=bool'"
-    print
-    print "Test List:"
-    for (modname, (mod, tests)) in test_modules.items():
-        mod_count += 1
-        desc = (mod.__doc__ or "No description").strip().split('\n')[0]
-        start_str = "  Module " + mod.__name__ + ": "
-        print start_str + _space_to(22, start_str) + desc
-        for (testname, test) in tests.items():
-            try:
-                desc = (test.__doc__ or "").strip()
-                desc = desc.split('\n')[0]
-            except:
-                desc = "No description"
-            groups = set(test._groups) - set(["all", "standard", modname])
-            all_groups.update(test._groups)
-            if groups:
-                desc = "(%s) %s" % (",".join(groups), desc)
-            if hasattr(test, "_versions"):
-                desc = "(%s) %s" % (",".join(sorted(test._versions)), desc)
-            start_str = " %s%s %s:" % (test._nonstandard and "*" or " ",
-                                       test._disabled and "!" or " ",
-                                       testname)
-            if len(start_str) > 22:
-                desc = "\n" + _space_to(22, "") + desc
-            print start_str + _space_to(22, start_str) + desc
-            test_count += 1
-        print
-    print "%d modules shown with a total of %d tests" % \
-        (mod_count, test_count)
-    print
-    print "Test groups: %s" % (', '.join(sorted(all_groups)))
-
-    sys.exit(0)
-
-test_modules = prune_tests(test_specs, test_modules, config["openflow_version"])
-
-# Check if test list is requested; display and exit if so
-if config["list_test_names"]:
-    for (modname, (mod, tests)) in test_modules.items():
-        for (testname, test) in tests.items():
-            print "%s.%s" % (modname, testname)
-    sys.exit(0)
-
-# Generate the test suite
-#@todo Decide if multiple suites are ever needed
-suite = unittest.TestSuite()
-
-for (modname, (mod, tests)) in test_modules.items():
-    for (testname, test) in tests.items():
-        suite.addTest(test())
-
-# Allow platforms to import each other
-sys.path.append(config["platform_dir"])
-
-# Load the platform module
-platform_name = config["platform"]
-logging.info("Importing platform: " + platform_name)
-platform_mod = None
-try:
-    platform_mod = imp.load_module(platform_name, *imp.find_module(platform_name, [config["platform_dir"]]))
-except:
-    logging.warn("Failed to import " + platform_name + " platform module")
-    raise
-
-try:
-    platform_mod.platform_config_update(config)
-except:
-    logging.warn("Could not run platform host configuration")
-    raise
-
-if not config["port_map"]:
-    die("Interface port map was not defined by the platform. Exiting.")
-
-logging.debug("Configuration: " + str(config))
-logging.info("OF port map: " + str(config["port_map"]))
-
-oftest.ofutils.default_timeout = config["default_timeout"]
-oftest.testutils.MINSIZE = config['minsize']
-
-if os.getuid() != 0 and not config["allow_user"]:
-    print "ERROR: Super-user privileges required. Please re-run with " \
-          "sudo or as root."
-    sys.exit(1)
-
-if config["random_seed"] is not None:
-    logging.info("Random seed: %d" % config["random_seed"])
-    random.seed(config["random_seed"])
-else:
-    # Generate random seed and report to log file
-    seed = random.randrange(100000000)
-    logging.info("Autogen random seed: %d" % seed)
-    random.seed(seed)
-
-# Remove python's signal handler which raises KeyboardError. Exiting from an
-# exception waits for all threads to terminate which might not happen.
-signal.signal(signal.SIGINT, signal.SIG_DFL)
-
 if __name__ == "__main__":
     # Set up the dataplane
+    suite = main_init_suite_get(oftest)
     oftest.dataplane_instance = oftest.dataplane.DataPlane(config)
     for of_port, ifname in config["port_map"].items():
         oftest.dataplane_instance.port_add(ifname, of_port)
